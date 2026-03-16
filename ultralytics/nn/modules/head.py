@@ -20,7 +20,18 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
+__all__ = (
+    "OBB",
+    "Classify",
+    "Detect",
+    "PPEPoseHead",
+    "Pose",
+    "RTDETRDecoder",
+    "Segment",
+    "YOLOEDetect",
+    "YOLOESegment",
+    "v10Detect",
+)
 
 
 class Detect(nn.Module):
@@ -650,6 +661,107 @@ class Pose(Detect):
             y[:, 0::ndim] = (y[:, 0::ndim] * 2.0 + (self.anchors[0] - 0.5)) * self.strides
             y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides
             return y
+
+
+class PPEPoseHead(Detect):
+    """Shared-feature dual head for PPE detection and person pose estimation."""
+
+    def __init__(
+        self,
+        nc: int = 2,
+        pose_nc: int = 1,
+        kpt_shape: tuple = (17, 3),
+        reg_max: int = 16,
+        end2end: bool = False,
+        ch: tuple = (),
+    ):
+        """Initialize PPE detection and person pose branches on top of the same pyramid features."""
+        super().__init__(nc=nc, reg_max=reg_max, end2end=False, ch=ch)
+        self.pose_nc = pose_nc
+        self.kpt_shape = list(kpt_shape)
+        self.nk = self.kpt_shape[0] * self.kpt_shape[1]
+        self.end2end = False
+        self.person_name = "person"
+
+        c2 = max((16, ch[0] // 4, self.reg_max * 4))
+        c3 = max(ch[0], min(self.pose_nc, 100))
+        c4 = max(ch[0] // 4, self.nk)
+
+        self.pose_cv2 = nn.ModuleList(
+            nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+        )
+        self.pose_cv3 = (
+            nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.pose_nc, 1)) for x in ch)
+            if self.legacy
+            else nn.ModuleList(
+                nn.Sequential(
+                    nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),
+                    nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
+                    nn.Conv2d(c3, self.pose_nc, 1),
+                )
+                for x in ch
+            )
+        )
+        self.pose_cv4 = nn.ModuleList(
+            nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.nk, 1)) for x in ch
+        )
+
+    def pose_forward_head(self, x: list[torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Return decoded tensors for the person pose branch."""
+        bs = x[0].shape[0]
+        boxes = torch.cat([self.pose_cv2[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
+        scores = torch.cat([self.pose_cv3[i](x[i]).view(bs, self.pose_nc, -1) for i in range(self.nl)], dim=-1)
+        kpts = torch.cat([self.pose_cv4[i](x[i]).view(bs, self.nk, -1) for i in range(self.nl)], dim=-1)
+        return dict(boxes=boxes, scores=scores, kpts=kpts, feats=x)
+
+    def forward(self, x: list[torch.Tensor]) -> dict[str, dict[str, torch.Tensor]]:
+        """Run both task heads and keep raw branch outputs for custom training and post-processing."""
+        det_preds = super().forward_head(x, **self.one2many)
+        pose_preds = self.pose_forward_head(x)
+        if self.training:
+            return {"det": det_preds, "pose": pose_preds, "feats": x}
+        return {
+            "det": {"decoded": self._inference(det_preds), "raw": det_preds},
+            "pose": {"decoded": self.pose_inference(pose_preds), "raw": pose_preds},
+        }
+
+    def pose_inference(self, preds: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Decode person boxes, scores, and keypoints."""
+        dbox = self._get_decode_boxes(preds)
+        return torch.cat((dbox, preds["scores"].sigmoid(), self.kpts_decode(preds["kpts"])), 1)
+
+    def bias_init(self):
+        """Initialize detection and person-pose branch biases."""
+        super().bias_init()
+        for i, (a, b, c) in enumerate(zip(self.pose_cv2, self.pose_cv3, self.pose_cv4)):
+            a[-1].bias.data[:] = 2.0
+            b[-1].bias.data[: self.pose_nc] = math.log(5 / self.pose_nc / (640 / self.stride[i]) ** 2)
+            c[-1].bias.data.zero_()
+
+    def fuse(self) -> None:
+        """Remove one-to-many branches for inference optimization."""
+        self.cv2 = self.cv3 = self.pose_cv2 = self.pose_cv3 = self.pose_cv4 = None
+
+    def kpts_decode(self, kpts: torch.Tensor) -> torch.Tensor:
+        """Decode keypoints from predictions."""
+        ndim = self.kpt_shape[1]
+        bs = kpts.shape[0]
+        if self.export:
+            y = kpts.view(bs, *self.kpt_shape, -1)
+            a = (y[:, :, :2] * 2.0 + (self.anchors - 0.5)) * self.strides
+            if ndim == 3:
+                a = torch.cat((a, y[:, :, 2:3].sigmoid()), 2)
+            return a.view(bs, self.nk, -1)
+
+        y = kpts.clone()
+        if ndim == 3:
+            if NOT_MACOS14:
+                y[:, 2::ndim].sigmoid_()
+            else:
+                y[:, 2::ndim] = y[:, 2::ndim].sigmoid()
+        y[:, 0::ndim] = (y[:, 0::ndim] * 2.0 + (self.anchors[0] - 0.5)) * self.strides
+        y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides
+        return y
 
 
 class Pose26(Pose):
