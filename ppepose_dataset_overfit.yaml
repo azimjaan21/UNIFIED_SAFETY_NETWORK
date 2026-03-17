@@ -1,0 +1,41 @@
+# Overfit/debug dataset built by duplicating the current small CVAT-derived set.
+
+path: ./datasets/ppepose_overfit
+train: images/train
+val: images/val
+test: images/test
+
+annotations:
+  train: annotations/train
+  val: annotations/val
+  test: annotations/test
+
+annotation_format: ppepose_json_v1
+channels: 3
+nc: 2
+names:
+  0: helmet
+  1: vest
+
+person_name: person
+kpt_shape: [17, 3]
+kpt_names:
+  0:
+    - nose
+    - left_eye
+    - right_eye
+    - left_ear
+    - right_ear
+    - left_shoulder
+    - right_shoulder
+    - left_elbow
+    - right_elbow
+    - left_wrist
+    - right_wrist
+    - left_hip
+    - right_hip
+    - left_knee
+    - right_knee
+    - left_ankle
+    - right_ankle
+flip_idx: [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15]

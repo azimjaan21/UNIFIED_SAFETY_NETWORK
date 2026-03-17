@@ -1,0 +1,53 @@
+# Unified PPE + pose model for industrial monitoring.
+# The backbone and neck are shared, while the final module exposes:
+# 1. A PPE detection branch for helmet and vest.
+# 2. A pose branch for person box + keypoints.
+
+task: ppepose
+scale: n  # Fixed lightweight starting point for edge-oriented experiments.
+nc: 2  # PPE classes: helmet, vest
+pose_nc: 1  # Single pose class: person
+person_name: person
+kpt_shape: [17, 3]  # COCO-style keypoints with visibility
+channels: 3
+reg_max: 16
+
+scales:
+  # [depth, width, max_channels]
+  n: [0.50, 0.25, 1024]
+
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]] # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
+  - [-1, 2, C3k2, [256, False, 0.25]]
+  - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
+  - [-1, 2, C3k2, [512, False, 0.25]]
+  - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
+  - [-1, 2, C3k2, [512, True]]
+  - [-1, 1, Conv, [1024, 3, 2]] # 7-P5/32
+  - [-1, 2, C3k2, [1024, True]]
+  - [-1, 1, SPPF, [1024, 5]] # 9
+  - [-1, 2, C2PSA, [1024]] # 10
+
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 6], 1, Concat, [1]] # Fuse P4 features
+  - [-1, 2, C3k2, [512, False]] # 13
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 4], 1, Concat, [1]] # Fuse P3 features
+  - [-1, 2, C3k2, [256, False]] # 16 (small scale)
+
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 13], 1, Concat, [1]]
+  - [-1, 2, C3k2, [512, False]] # 19 (medium scale)
+
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 10], 1, Concat, [1]]
+  - [-1, 2, C3k2, [1024, True]] # 22 (large scale)
+
+  # Shared pyramid features feed a custom dual-head module.
+  # Branch A: PPE detection for helmet and vest.
+  # Branch B: person box + keypoints pose estimation.
+  - [[16, 19, 22], 1, PPEPoseHead, [nc, pose_nc, kpt_shape]]
